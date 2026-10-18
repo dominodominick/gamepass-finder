@@ -3,8 +3,15 @@
     Lists EVERY game pass and developer product in the current
     universe - including ones the game's own shop UI hides.
     Click any entry to open the Roblox purchase prompt.
-    Right-click an entry to copy its ID.
+    Shift+click uses the alternative prompt API.
+    Right-click copies the ID.
 ===================================================================]]
+
+local genv = (getgenv and getgenv()) or _G
+if genv.PPBrowserUnhook then pcall(genv.PPBrowserUnhook) end
+if genv.PPBrowserGui and genv.PPBrowserGui.Parent then
+	pcall(function() genv.PPBrowserGui:Destroy() end)
+end
 
 local Players            = game:GetService("Players")
 local MarketplaceService = game:GetService("MarketplaceService")
@@ -44,12 +51,13 @@ end
 -------------------------------------------------------------------
 -- state
 -------------------------------------------------------------------
-local ITEMS  = {}
-local SEEN   = {}
-local ROWS   = {}
-local ACTIVE = "pass"
-local QUERY  = ""
-local alive  = true
+local ITEMS      = {}
+local SEEN       = {}
+local ROWS       = {}
+local ACTIVE     = "pass"
+local QUERY      = ""
+local alive      = true
+local promptLock = false
 
 local function addItem(kind, id, name, price, forSale)
 	if not id then return false end
@@ -150,6 +158,7 @@ gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 gui.Parent = parentGui
+genv.PPBrowserGui = gui
 
 local main = Instance.new("Frame")
 main.Size = UDim2.fromOffset(480, 440)
@@ -214,18 +223,20 @@ local function makeTab(text, x, w)
 	return b
 end
 
-local tabPass = makeTab("Game Passes (0)", 10, 140)
-local tabProd = makeTab("Products (0)", 156, 140)
+local tabPass    = makeTab("Game Passes (0)", 10, 132)
+local tabProd    = makeTab("Products (0)", 148, 132)
+local refreshBtn = makeTab("Rescan", 286, 62)
 
-local refreshBtn = makeTab("Rescan", 302, 70)
 local copyHint = Instance.new("TextLabel")
 copyHint.BackgroundTransparency = 1
-copyHint.Position = UDim2.fromOffset(376, 46)
-copyHint.Size = UDim2.new(0, 96, 0, 26)
+copyHint.Position = UDim2.fromOffset(354, 44)
+copyHint.Size = UDim2.new(0, 116, 0, 30)
 copyHint.Font = Enum.Font.Gotham
-copyHint.TextSize = 11
+copyHint.TextSize = 10
+copyHint.TextWrapped = true
+copyHint.TextXAlignment = Enum.TextXAlignment.Right
 copyHint.TextColor3 = Color3.fromRGB(120, 120, 135)
-copyHint.Text = "right-click = copy ID"
+copyHint.Text = "RMB copy ID  |  Shift+click alt prompt"
 copyHint.Parent = main
 
 -- search ------------------------------------------------------
@@ -294,6 +305,43 @@ toggle.MouseButton1Click:Connect(function() main.Visible = not main.Visible end)
 closeBtn.MouseButton1Click:Connect(function() main.Visible = false end)
 
 -------------------------------------------------------------------
+-- prompt
+-------------------------------------------------------------------
+local function firePrompt(it, useAlt)
+	if promptLock then
+		status.Text = "prompt busy, wait a moment..."
+		return
+	end
+	promptLock = true
+
+	task.spawn(function()
+		local id = tonumber(it.id)
+		status.Text = "prompting " .. it.kind .. " " .. tostring(id) .. "..."
+
+		local ok, err = pcall(function()
+			if useAlt then
+				MarketplaceService:PromptPurchase(LP, id)
+			elseif it.kind == "pass" then
+				MarketplaceService:PromptGamePassPurchase(LP, id)
+			else
+				MarketplaceService:PromptProductPurchase(LP, id)
+			end
+		end)
+
+		if ok then
+			print("[prompt] fired", it.kind, id, useAlt and "(alt)" or "")
+			status.Text = "prompted " .. it.kind .. " " .. id .. "   (owned / off-sale may show no buy button)"
+		else
+			warn("[prompt] error", err)
+			status.Text = "prompt error: " .. tostring(err)
+		end
+
+		task.wait(1.1)
+		promptLock = false
+	end)
+end
+
+-------------------------------------------------------------------
 -- render
 -------------------------------------------------------------------
 local function render()
@@ -306,7 +354,6 @@ local function render()
 	end
 	tabPass.Text = "Game Passes (" .. nPass .. ")"
 	tabProd.Text = "Products (" .. nProd .. ")"
-
 	tabPass.BackgroundColor3 = ACTIVE == "pass" and Color3.fromRGB(0, 130, 200) or Color3.fromRGB(36, 36, 43)
 	tabProd.BackgroundColor3 = ACTIVE == "product" and Color3.fromRGB(0, 130, 200) or Color3.fromRGB(36, 36, 43)
 
@@ -385,17 +432,13 @@ local function render()
 		end)
 
 		row.MouseButton1Click:Connect(function()
-			if it.kind == "pass" then
-				MarketplaceService:PromptGamePassPurchase(LP, it.id)
-			else
-				MarketplaceService:PromptProductPurchase(LP, it.id)
-			end
+			firePrompt(it, UIS:IsKeyDown(Enum.KeyCode.LeftShift))
 		end)
 
 		row.MouseButton2Click:Connect(function()
 			if setclipboard then
 				setclipboard(tostring(it.id))
-				status.Text = "copied ID " .. it.id
+				status.Text = "copied " .. it.id .. "  ->  roblox.com/game-pass/" .. it.id
 			end
 		end)
 
@@ -415,17 +458,16 @@ search:GetPropertyChangedSignal("Text"):Connect(function()
 	render()
 end)
 
--- drag --------------------------------------------------------
+-------------------------------------------------------------------
+-- drag
+-------------------------------------------------------------------
 local dragging, dragStart, startPos
-local function beginDrag(input)
-	dragging = true
-	dragStart = input.Position
-	startPos = main.Position
-end
 header.InputBegan:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.MouseButton1
 		or input.UserInputType == Enum.UserInputType.Touch then
-		beginDrag(input)
+		dragging = true
+		dragStart = input.Position
+		startPos = main.Position
 	end
 end)
 UIS.InputChanged:Connect(function(input)
@@ -452,23 +494,35 @@ UIS.InputBegan:Connect(function(input, gpe)
 end)
 
 -------------------------------------------------------------------
--- enrichment: fill in real price / on-sale status
+-- enrichment: fill in real price / on-sale status + verify asset type
 -------------------------------------------------------------------
 local function enrich()
 	for _, it in ipairs(ITEMS) do
 		if not alive then return end
-		if it.price == nil or it.forSale == nil then
+
+		local expected = it.kind == "pass" and 34 or 35
+
+		if it.price == nil or it.forSale == nil or it.assetType == nil then
 			local infoType = it.kind == "pass" and Enum.InfoType.GamePass or Enum.InfoType.Product
 			local ok, info = pcall(function()
 				return MarketplaceService:GetProductInfo(it.id, infoType)
 			end)
+
 			if ok and info then
+				it.assetType = info.AssetTypeId
 				if info.Name and info.Name ~= "" then it.name = info.Name end
 				it.forSale = info.IsForSale
 				it.price = info.IsForSale and info.PriceInRobux or nil
+
+				-- wrong asset type for its slot -> the prompt would silently no-op
+				if it.assetType and it.assetType ~= expected then
+					print(string.format("[warn] %s %d is AssetTypeId %d (expected %d)",
+						it.kind, it.id, it.assetType, expected))
+				end
 			else
 				it.forSale = false
 			end
+
 			render()
 			task.wait(0.07)
 		end
@@ -499,6 +553,12 @@ local function installHook()
 		return old(self, ...)
 	end)
 	setreadonly(mt, true)
+
+	genv.PPBrowserUnhook = function()
+		setreadonly(mt, false)
+		mt.__namecall = old
+		setreadonly(mt, true)
+	end
 end
 
 -------------------------------------------------------------------
@@ -506,15 +566,14 @@ end
 -------------------------------------------------------------------
 task.spawn(function()
 	installHook()
+	print("[browser] universe " .. UNIVERSE .. " | executor: " ..
+		(identifyexecutor and identifyexecutor() or "unknown"))
+
 	status.Text = "scanning universe " .. UNIVERSE .. "..."
-	fetchPassesEngine()
-	render()
-	fetchProductsEngine()
-	render()
-	fetchPassesWeb()
-	render()
-	fetchProductsWeb()
-	render()
+	fetchPassesEngine();   render()
+	fetchProductsEngine(); render()
+	fetchPassesWeb();      render()
+	fetchProductsWeb();    render()
 	enrich()
 	status.Text = status.Text .. "  (done)"
 end)
@@ -522,8 +581,8 @@ end)
 refreshBtn.MouseButton1Click:Connect(function()
 	status.Text = "rescanning..."
 	task.spawn(function()
-		fetchPassesEngine(); fetchPassesWeb(); render()
-		fetchProductsEngine(); fetchProductsWeb(); render()
+		fetchPassesEngine();   fetchPassesWeb();      render()
+		fetchProductsEngine(); fetchProductsWeb();    render()
 		enrich()
 	end)
 end)
