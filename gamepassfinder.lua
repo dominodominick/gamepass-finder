@@ -3,8 +3,8 @@
     Lists EVERY game pass and developer product in the current
     universe - including ones the game's own shop UI hides.
     Click any entry to open the Roblox purchase prompt.
-    Shift+click uses the alternative prompt API.
-    Right-click copies the ID.
+    Shift+click runs a prompt diagnostic. Ctrl+click copies the
+    web link. Right-click copies the ID.
 ===================================================================]]
 
 local genv = (getgenv and getgenv()) or _G
@@ -16,9 +16,11 @@ end
 local Players            = game:GetService("Players")
 local MarketplaceService = game:GetService("MarketplaceService")
 local HttpService        = game:GetService("HttpService")
-local UIS                = game:GetService("UserInputService")
+local UserInputService   = game:GetService("UserInputService")
+local RunService         = game:GetService("RunService")
 
-local LP = Players.LocalPlayer
+local UIS = UserInputService
+local LP  = Players.LocalPlayer
 
 -------------------------------------------------------------------
 -- helpers
@@ -223,21 +225,22 @@ local function makeTab(text, x, w)
 	return b
 end
 
-local tabPass    = makeTab("Game Passes (0)", 10, 132)
-local tabProd    = makeTab("Products (0)", 148, 132)
-local refreshBtn = makeTab("Rescan", 286, 62)
+local tabPass    = makeTab("Game Passes (0)", 10, 120)
+local tabProd    = makeTab("Products (0)", 136, 120)
+local refreshBtn = makeTab("Rescan", 262, 56)
 
-local copyHint = Instance.new("TextLabel")
-copyHint.BackgroundTransparency = 1
-copyHint.Position = UDim2.fromOffset(354, 44)
-copyHint.Size = UDim2.new(0, 116, 0, 30)
-copyHint.Font = Enum.Font.Gotham
-copyHint.TextSize = 10
-copyHint.TextWrapped = true
-copyHint.TextXAlignment = Enum.TextXAlignment.Right
-copyHint.TextColor3 = Color3.fromRGB(120, 120, 135)
-copyHint.Text = "RMB copy ID  |  Shift+click alt prompt"
-copyHint.Parent = main
+local hint = Instance.new("TextLabel")
+hint.BackgroundTransparency = 1
+hint.Position = UDim2.fromOffset(324, 42)
+hint.Size = UDim2.new(0, 146, 0, 36)
+hint.Font = Enum.Font.Gotham
+hint.TextSize = 9
+hint.TextWrapped = true
+hint.TextXAlignment = Enum.TextXAlignment.Right
+hint.TextYAlignment = Enum.TextYAlignment.Top
+hint.TextColor3 = Color3.fromRGB(115, 115, 132)
+hint.Text = "copy ID: right-click\ndiagnose: shift+click\nweb link: ctrl+click"
+hint.Parent = main
 
 -- search ------------------------------------------------------
 local search = Instance.new("TextBox")
@@ -305,38 +308,139 @@ toggle.MouseButton1Click:Connect(function() main.Visible = not main.Visible end)
 closeBtn.MouseButton1Click:Connect(function() main.Visible = false end)
 
 -------------------------------------------------------------------
--- prompt
+-- prompt dispatch
+-- executor threads can be "blocked" for this API, so try several
+-- call paths and remember whichever one gets through.
 -------------------------------------------------------------------
-local function firePrompt(it, useAlt)
+local getIdent = getthreadidentity or getidentity
+local setIdent = setthreadidentity or setidentity
+
+local function rawPrompt(kind, id, viaDot)
+	if kind == "pass" then
+		if viaDot then
+			MarketplaceService.PromptGamePassPurchase(MarketplaceService, LP, id)
+		else
+			MarketplaceService:PromptGamePassPurchase(LP, id)
+		end
+	else
+		if viaDot then
+			MarketplaceService.PromptProductPurchase(MarketplaceService, LP, id)
+		else
+			MarketplaceService:PromptProductPurchase(LP, id)
+		end
+	end
+end
+
+local function withIdentity(n, fn)
+	local prev
+	if type(setIdent) == "function" then
+		pcall(function() prev = getIdent and getIdent() end)
+		pcall(setIdent, n)
+	end
+	local ok, err = pcall(fn)
+	if type(setIdent) == "function" and type(prev) == "number" then
+		pcall(setIdent, prev)
+	end
+	if not ok then error(err, 0) end
+end
+
+local STRATEGIES = {
+	{ name = "dotcall",   fn = function(k, id) rawPrompt(k, id, true) end },
+	{ name = "direct",    fn = function(k, id) rawPrompt(k, id, false) end },
+	{ name = "yield",     fn = function(k, id) task.wait() rawPrompt(k, id, false) end },
+	{ name = "ident2",    fn = function(k, id)
+		withIdentity(2, function() rawPrompt(k, id, false) end)
+	end },
+	{ name = "ident8",    fn = function(k, id)
+		withIdentity(8, function() rawPrompt(k, id, false) end)
+	end },
+	{ name = "heartbeat", fn = function(k, id)
+		local fired = false
+		local conn
+		conn = RunService.Heartbeat:Connect(function()
+			conn:Disconnect()
+			rawPrompt(k, id, false)
+			fired = true
+		end)
+		local t = 0
+		while not fired and t < 1 do t += task.wait() end
+	end },
+	{ name = "altapi",    fn = function(k, id)
+		MarketplaceService:PromptPurchase(LP, id)
+	end },
+}
+
+local bestStrategy
+
+local function dispatch(kind, id)
+	local order = {}
+	if bestStrategy then order[#order + 1] = bestStrategy end
+	for _, s in ipairs(STRATEGIES) do
+		if s ~= bestStrategy then order[#order + 1] = s end
+	end
+
+	for _, s in ipairs(order) do
+		local ok, err = pcall(s.fn, kind, id)
+		if ok then
+			if bestStrategy ~= s then
+				bestStrategy = s
+				print("[browser] prompt strategy -> " .. s.name)
+			end
+			return true, s.name
+		end
+		print("[browser] strategy '" .. s.name .. "' blocked: " .. tostring(err))
+		task.wait(0.2)
+	end
+	return false, "none"
+end
+
+local function diagnose(kind, id)
+	print("=== prompt diagnostic: " .. kind .. " " .. tostring(id) .. " ===")
+	print("executor:", identifyexecutor and identifyexecutor() or "unknown")
+	print("thread identity:", getIdent and tostring(getIdent()) or "n/a")
+	for _, s in ipairs(STRATEGIES) do
+		local ok, err = pcall(s.fn, kind, id)
+		print(string.format("  %-10s %s%s", s.name,
+			ok and "OK" or "FAIL", ok and "" or ("   " .. tostring(err))))
+		task.wait(1.3)
+	end
+	print("=== end diagnostic ===")
+end
+
+local function firePrompt(it, mode)
+	local id = tonumber(it.id)
+	if not id then return end
+
+	if mode == "web" then
+		local url = it.kind == "pass"
+			and ("https://www.roblox.com/game-pass/" .. id)
+			or ("https://www.roblox.com/developer-product/" .. id)
+		if setclipboard then setclipboard(url) end
+		status.Text = "copied: " .. url
+		return
+	end
+
 	if promptLock then
-		status.Text = "prompt busy, wait a moment..."
+		status.Text = "busy, wait a moment..."
 		return
 	end
 	promptLock = true
 
 	task.spawn(function()
-		local id = tonumber(it.id)
-		status.Text = "prompting " .. it.kind .. " " .. tostring(id) .. "..."
-
-		local ok, err = pcall(function()
-			if useAlt then
-				MarketplaceService:PromptPurchase(LP, id)
-			elseif it.kind == "pass" then
-				MarketplaceService:PromptGamePassPurchase(LP, id)
-			else
-				MarketplaceService:PromptProductPurchase(LP, id)
-			end
-		end)
-
-		if ok then
-			print("[prompt] fired", it.kind, id, useAlt and "(alt)" or "")
-			status.Text = "prompted " .. it.kind .. " " .. id .. "   (owned / off-sale may show no buy button)"
+		if mode == "diag" then
+			status.Text = "running diagnostic..."
+			diagnose(it.kind, id)
+			status.Text = "diagnostic printed to console"
 		else
-			warn("[prompt] error", err)
-			status.Text = "prompt error: " .. tostring(err)
+			status.Text = "prompting " .. it.kind .. " " .. id .. "..."
+			local ok, used = dispatch(it.kind, id)
+			if ok then
+				status.Text = "prompted " .. it.kind .. " " .. id .. "  [" .. used .. "]"
+			else
+				status.Text = "every prompt path blocked - ctrl+click for the web link"
+			end
 		end
-
-		task.wait(1.1)
+		task.wait(1.2)
 		promptLock = false
 	end)
 end
@@ -432,13 +536,20 @@ local function render()
 		end)
 
 		row.MouseButton1Click:Connect(function()
-			firePrompt(it, UIS:IsKeyDown(Enum.KeyCode.LeftShift))
+			if UIS:IsKeyDown(Enum.KeyCode.LeftShift) then
+				firePrompt(it, "diag")
+			elseif UIS:IsKeyDown(Enum.KeyCode.LeftControl)
+				or UIS:IsKeyDown(Enum.KeyCode.RightControl) then
+				firePrompt(it, "web")
+			else
+				firePrompt(it, "auto")
+			end
 		end)
 
 		row.MouseButton2Click:Connect(function()
 			if setclipboard then
 				setclipboard(tostring(it.id))
-				status.Text = "copied " .. it.id .. "  ->  roblox.com/game-pass/" .. it.id
+				status.Text = "copied ID " .. it.id
 			end
 		end)
 
@@ -514,7 +625,6 @@ local function enrich()
 				it.forSale = info.IsForSale
 				it.price = info.IsForSale and info.PriceInRobux or nil
 
-				-- wrong asset type for its slot -> the prompt would silently no-op
 				if it.assetType and it.assetType ~= expected then
 					print(string.format("[warn] %s %d is AssetTypeId %d (expected %d)",
 						it.kind, it.id, it.assetType, expected))
@@ -532,6 +642,7 @@ end
 
 -------------------------------------------------------------------
 -- bonus: catch passes/products the game uses at runtime
+-- set genv.PPBrowserNoHook = true before running to skip it
 -------------------------------------------------------------------
 local function installHook()
 	local ok, mt = pcall(getrawmetatable, game)
@@ -565,9 +676,13 @@ end
 -- go
 -------------------------------------------------------------------
 task.spawn(function()
-	installHook()
-	print("[browser] universe " .. UNIVERSE .. " | executor: " ..
-		(identifyexecutor and identifyexecutor() or "unknown"))
+	if not genv.PPBrowserNoHook then installHook() end
+
+	print(string.format("[browser] universe %s | executor %s | identity %s | newcclosure %s",
+		tostring(UNIVERSE),
+		identifyexecutor and identifyexecutor() or "unknown",
+		getIdent and tostring(getIdent()) or "n/a",
+		newcclosure and "yes" or "NO"))
 
 	status.Text = "scanning universe " .. UNIVERSE .. "..."
 	fetchPassesEngine();   render()
@@ -581,8 +696,8 @@ end)
 refreshBtn.MouseButton1Click:Connect(function()
 	status.Text = "rescanning..."
 	task.spawn(function()
-		fetchPassesEngine();   fetchPassesWeb();      render()
-		fetchProductsEngine(); fetchProductsWeb();    render()
+		fetchPassesEngine();   fetchPassesWeb();   render()
+		fetchProductsEngine(); fetchProductsWeb(); render()
 		enrich()
 	end)
 end)
